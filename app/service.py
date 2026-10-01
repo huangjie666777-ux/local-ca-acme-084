@@ -45,10 +45,20 @@ class CAService:
         self, csr_pem: bytes, days: int, idempotency_key: str
     ) -> tuple[CertificateRecord, bool]:
         csr = parse_csr(csr_pem)
+        csr_der = csr.public_bytes(serialization.Encoding.DER)
+        return self.issue_der(csr_der, days, idempotency_key)
+
+    def issue_der(
+        self, csr_der: bytes, days: int, idempotency_key: str
+    ) -> tuple[CertificateRecord, bool]:
+        """Issue from a DER-encoded CSR, reusing the shared policy."""
+        try:
+            csr = x509.load_der_x509_csr(csr_der)
+        except (ValueError, TypeError) as exc:
+            raise policy.PolicyError(f"invalid DER CSR: {exc}") from exc
         policy.validate_days(days)
         key = policy.validate_idempotency_key(idempotency_key)
         dns_names = policy.validate_csr(csr)
-        csr_der = csr.public_bytes(serialization.Encoding.DER)
 
         now = dt.datetime.now(dt.timezone.utc)
         not_before = now - dt.timedelta(minutes=1)

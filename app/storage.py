@@ -68,6 +68,41 @@ class IssueResult:
     replayed: bool
 
 
+@dataclass(frozen=True)
+class AcmeAccountRecord:
+    id: int
+    thumbprint: str
+    jwk_json: str
+    contact: str
+    status: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AcmeOrderRecord:
+    id: int
+    account_id: int
+    status: str
+    domain: str
+    expires: str
+    created_at: str
+    csr_der: bytes | None
+    cert_serial: str | None
+
+
+@dataclass(frozen=True)
+class AcmeAuthzRecord:
+    id: int
+    order_id: int
+    account_id: int
+    domain: str
+    status: str
+    expires: str
+    token: str
+    chall_status: str
+    validated_at: str | None
+
+
 SignCallback = Callable[[int], tuple[str, list[str], str, str]]
 BuildCrlCallback = Callable[[list[RevokedRecord], int, str], str]
 
@@ -101,6 +136,35 @@ CREATE TABLE crl_state (
     number INTEGER NOT NULL,
     crl_pem TEXT NOT NULL,
     published_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS acme_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thumbprint TEXT NOT NULL UNIQUE,
+    jwk_json TEXT NOT NULL,
+    contact TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'valid',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS acme_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES acme_accounts(id),
+    status TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    expires TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    csr_der BLOB,
+    cert_serial TEXT
+);
+CREATE TABLE IF NOT EXISTS acme_authz (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL UNIQUE REFERENCES acme_orders(id),
+    account_id INTEGER NOT NULL,
+    domain TEXT NOT NULL,
+    status TEXT NOT NULL,
+    expires TEXT NOT NULL,
+    token TEXT NOT NULL,
+    chall_status TEXT NOT NULL,
+    validated_at TEXT
 );
 """
 
@@ -352,6 +416,218 @@ class CAStore:
         if row is None:
             return None
         return row["crl_pem"], row["number"]
+
+    # ------------------------------------------------------------------
+    # ACME (RFC 8555 subset) persistence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_acme_account(row: sqlite3.Row) -> AcmeAccountRecord:
+        return AcmeAccountRecord(
+            id=row["id"],
+            thumbprint=row["thumbprint"],
+            jwk_json=row["jwk_json"],
+            contact=row["contact"],
+            status=row["status"],
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _row_to_acme_order(row: sqlite3.Row) -> AcmeOrderRecord:
+        return AcmeOrderRecord(
+            id=row["id"],
+            account_id=row["account_id"],
+            status=row["status"],
+            domain=row["domain"],
+            expires=row["expires"],
+            created_at=row["created_at"],
+            csr_der=bytes(row["csr_der"]) if row["csr_der"] is not None else None,
+            cert_serial=row["cert_serial"],
+        )
+
+    @staticmethod
+    def _row_to_acme_authz(row: sqlite3.Row) -> AcmeAuthzRecord:
+        return AcmeAuthzRecord(
+            id=row["id"],
+            order_id=row["order_id"],
+            account_id=row["account_id"],
+            domain=row["domain"],
+            status=row["status"],
+            expires=row["expires"],
+            token=row["token"],
+            chall_status=row["chall_status"],
+            validated_at=row["validated_at"],
+        )
+
+    def acme_create_account(
+        self, thumbprint: str, jwk_json: str, contact_json: str, now_iso: str
+    ) -> AcmeAccountRecord:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO acme_accounts(thumbprint, jwk_json, contact, "
+                "status, created_at) VALUES(?,?,?,?,?)",
+                (thumbprint, jwk_json, contact_json, "valid", now_iso),
+            )
+            row = conn.execute(
+                "SELECT * FROM acme_accounts WHERE thumbprint = ?", (thumbprint,)
+            ).fetchone()
+            return self._row_to_acme_account(row)
+
+    def acme_get_account_by_thumbprint(
+        self, thumbprint: str
+    ) -> AcmeAccountRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM acme_accounts WHERE thumbprint = ?", (thumbprint,)
+            ).fetchone()
+        return self._row_to_acme_account(row) if row is not None else None
+
+    def acme_get_account(self, account_id: int) -> AcmeAccountRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM acme_accounts WHERE id = ?", (account_id,)
+            ).fetchone()
+        return self._row_to_acme_account(row) if row is not None else None
+
+    def acme_create_order(
+        self,
+        account_id: int,
+        domain: str,
+        expires_iso: str,
+        now_iso: str,
+        token: str,
+    ) -> tuple[AcmeOrderRecord, AcmeAuthzRecord]:
+        """Create an order plus its single pending authorization atomically."""
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO acme_orders(account_id, status, domain, "
+                    "expires, created_at) VALUES(?,?,?,?,?)",
+                    (account_id, "pending", domain, expires_iso, now_iso),
+                )
+                order_id = cur.lastrowid
+                conn.execute(
+                    "INSERT INTO acme_authz(order_id, account_id, domain, "
+                    "status, expires, token, chall_status) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        order_id,
+                        account_id,
+                        domain,
+                        "pending",
+                        expires_iso,
+                        token,
+                        "pending",
+                    ),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+            order_row = conn.execute(
+                "SELECT * FROM acme_orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            authz_row = conn.execute(
+                "SELECT * FROM acme_authz WHERE order_id = ?", (order_id,)
+            ).fetchone()
+            return (
+                self._row_to_acme_order(order_row),
+                self._row_to_acme_authz(authz_row),
+            )
+
+    def acme_get_order(self, order_id: int) -> AcmeOrderRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM acme_orders WHERE id = ?", (order_id,)
+            ).fetchone()
+        return self._row_to_acme_order(row) if row is not None else None
+
+    def acme_get_authz(self, authz_id: int) -> AcmeAuthzRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM acme_authz WHERE id = ?", (authz_id,)
+            ).fetchone()
+        return self._row_to_acme_authz(row) if row is not None else None
+
+    def acme_get_authz_by_order(self, order_id: int) -> AcmeAuthzRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM acme_authz WHERE order_id = ?", (order_id,)
+            ).fetchone()
+        return self._row_to_acme_authz(row) if row is not None else None
+
+    def acme_mark_challenge_valid(self, authz_id: int, now_iso: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE acme_authz SET status = 'valid', chall_status = 'valid', "
+                "validated_at = ? WHERE id = ? AND status = 'pending'",
+                (now_iso, authz_id),
+            )
+
+    def acme_mark_challenge_invalid(self, authz_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE acme_authz SET status = 'invalid', chall_status = 'invalid' "
+                "WHERE id = ? AND status = 'pending'",
+                (authz_id,),
+            )
+
+    def acme_mark_order_invalid(self, order_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE acme_orders SET status = 'invalid' "
+                "WHERE id = ? AND status = 'pending'",
+                (order_id,),
+            )
+
+    def acme_mark_authz_invalid(self, authz_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE acme_authz SET status = 'invalid', chall_status = 'invalid' "
+                "WHERE id = ? AND status = 'pending'",
+                (authz_id,),
+            )
+
+    def acme_mark_order_processing(self, order_id: int) -> bool:
+        """Transition pending -> processing. Returns False if already claimed."""
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE acme_orders SET status = 'processing' "
+                "WHERE id = ? AND status = 'pending'",
+                (order_id,),
+            )
+            return cur.rowcount == 1
+
+    def acme_mark_order_pending(self, order_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE acme_orders SET status = 'pending' "
+                "WHERE id = ? AND status = 'processing'",
+                (order_id,),
+            )
+
+    def acme_mark_order_valid(
+        self, order_id: int, csr_der: bytes, cert_serial: str
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE acme_orders SET status = 'valid', csr_der = ?, "
+                "cert_serial = ? WHERE id = ?",
+                (csr_der, cert_serial, order_id),
+            )
+
+    def acme_force_expire(self, order_id: int, expires_iso: str) -> None:
+        """Test helper: push an order's expiry into the past."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE acme_orders SET expires = ? WHERE id = ?",
+                (expires_iso, order_id),
+            )
+            conn.execute(
+                "UPDATE acme_authz SET expires = ? WHERE order_id = ?",
+                (expires_iso, order_id),
+            )
 
 
 def _utcnow_iso() -> str:

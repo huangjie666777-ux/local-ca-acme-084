@@ -3,14 +3,18 @@
 本机联调用的证书签发与吊销后端（Python 3.10 + FastAPI + cryptography）。
 服务只绑定 `127.0.0.1`，无前端，数据与私钥均保存在本机数据目录。
 
+除原有签发/吊销/CRL 接口外，另实现了一个 **RFC 8555 ACME 子集**，
+支持自动申领域名证书（HTTP-01 验证）。
+
 ## 启动
 
 ```sh
 .venv/bin/python -m pip install -r requirements.lock.txt
 
 # 默认数据目录为 ./data，可用 LOCAL_CA_DATA_DIR 覆盖
-LOCAL_CA_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app \
-  --host 127.0.0.1 --port 8000
+# ACME_CHALLENGE_PORT 指定本机 HTTP-01 应答服务端口（默认 80）
+LOCAL_CA_DATA_DIR=./data ACME_CHALLENGE_PORT=8099 \
+  .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 - 数据目录为空时，启动会自动生成 4096 位 RSA 自签根 CA（有效期 10 年）。
@@ -25,7 +29,8 @@ LOCAL_CA_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app \
 - `ca_key.pem`：CA 私钥，PKCS#8 PEM、**无口令加密**，文件权限 `0600`，
   仅存本机，不提供任何下载接口；请只在隔离的本机联调环境使用。
 - `ca_cert.pem`：CA 证书，权限 `0644`，可通过接口下载。
-- `ca.sqlite3`：证书记录、幂等键、吊销状态与 CRL 编号（WAL 模式）。
+- `ca.sqlite3`：证书记录、幂等键、吊销状态、CRL 编号，以及 ACME 账号、
+  申领、授权记录（WAL 模式）。
 
 ## 签发策略
 
@@ -34,11 +39,12 @@ LOCAL_CA_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app \
   CN 不能代替 SAN。
 - DNS 名称按标签匹配，仅接受 `lab.test` 与其任意层级子域
   （如 `api.lab.test`、`a.b.lab.test`）；拒绝通配符，大小写归一。
-- `days` 为 1–30 的整数；证书有效期不会越过 CA 自身到期时间。
+- `days` 为 1–30 的整数；布尔值（`true`/`false`）与字符串天数一律拒绝。
+- 证书有效期不会越过 CA 自身到期时间。
 - 签发证书：CA=false、KeyUsage=`digitalSignature,keyEncipherment`、
   EKU 仅 `serverAuth`，并设置规范化后的 SAN、SKI/AKI；不照搬 CSR 中其他扩展。
 
-## 接口
+## 原有接口
 
 | 方法/路径 | 说明 |
 | --- | --- |
@@ -61,7 +67,59 @@ LOCAL_CA_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app \
 吊销不可撤回。CRL 由 CA 签名，包含全部吊销记录，`CRLNumber` 持久化递增，
 启动时即发布首份空 CRL。
 
+## ACME（RFC 8555 子集）
+
+### 范围
+
+实现：`directory`、`newNonce`、`newAccount`、`newOrder`、授权（authz）与
+`http-01` 挑战、`finalize`、证书下载；查询类操作（账号、申领、授权、证书）
+一律 POST-as-GET。
+
+不含：密钥更换（key rollover）、账号停用、ACME 协议吊销（吊销仍走原有
+`POST /certificates/{serial}/revoke` 接口）。
+
+### 账号与 JWS
+
+- 账号仅接受 RSA ≥ 2048 位、签名算法仅 `RS256`（RSA PKCS#1 v1.5 + SHA-256）。
+- 注册用 JWK（`protected.jwk`），其余请求用 kid（`protected.kid`）；
+  校验 JWS 签名、`protected.url` 与请求路径一致、nonce 有效。
+- 重复公钥注册复用同一账号；资源（申领、授权、证书）仅限本账号访问。
+- nonce 有效期 5 分钟，一次性使用；并发重放最多一次成功，其余返回
+  `badNonce` 并附带新的 `Replay-Nonce`。
+
+### 申领与验证
+
+- 每次申领一个 `lab.test` 或其子域，拒绝通配符与多标识符；申领 10 分钟过期。
+- 仅支持 `http-01`：服务端只连接本机 `127.0.0.1`（端口由
+  `ACME_CHALLENGE_PORT` 配置，默认 80），HTTP `Host` 头为目标域名，
+  路径沿用协议（`/.well-known/acme-challenge/<token>`）；禁止重定向，
+  限制超时（5 秒）与响应大小（64 KiB）。
+- 按账号 JWK 指纹校验 `keyAuthorization`（`<token>.<jwk-thumbprint>`）。
+- 未验证或已过期不得签发。`finalize` 接收 base64url 编码的 DER CSR，
+  其 SAN 必须等于申领域名；复用原有策略与 CA 签发 **7 天**证书。
+- 同一申领并发提交相同 CSR 只签一张；不同 CSR 返回 `409 badCSR`。
+- 账号、授权、申领、证书关联入 SQLite，重启可继续；签发失败不留孤立证书。
+
+### ACME 接口
+
+| 方法/路径 | 说明 |
+| --- | --- |
+| `GET /acme/directory` | 目录 |
+| `GET|HEAD /acme/new-nonce` | 获取 `Replay-Nonce`（204） |
+| `POST /acme/new-account` | 注册/复用账号（JWK），201/200 + `Location` |
+| `POST /acme/new-order` | 新建申领，201 + `Location` |
+| `POST /acme/order/{id}` | 查询申领（POST-as-GET） |
+| `POST /acme/order/{id}/finalize` | 提交 CSR（`{"csr": "<base64url DER>"}`） |
+| `POST /acme/order/{id}/cert` | 下载证书链（POST-as-GET） |
+| `POST /acme/authz/{id}` | 查询授权（POST-as-GET） |
+| `POST /acme/authz/{id}/chall/http-01` | 触发 HTTP-01 验证 |
+
+错误返回 RFC 7807 problem 文档（`application/problem+json`），
+类型为 `urn:ietf:params:acme:error:*`。
+
 ## curl 演示
+
+### 原有接口
 
 ```sh
 # 下载 CA 证书
@@ -101,6 +159,34 @@ curl -s http://127.0.0.1:8000/crl/current.pem -o crl.pem
 openssl crl -in crl.pem -noout -CAfile ca_cert.pem -text
 ```
 
+### ACME 自动申领
+
+先启动 CA 与本机 HTTP-01 应答服务，再用演示客户端完成申领：
+
+```sh
+# 1. 启动 CA（挑战端口与应答服务一致）
+ACME_CHALLENGE_PORT=8099 .venv/bin/python -m uvicorn app.main:app \
+  --host 127.0.0.1 --port 8000
+
+# 2. 启动 HTTP-01 应答服务（应答 webroot/.well-known/acme-challenge/）
+.venv/bin/python scripts/http01_responder.py --port 8099 --webroot ./webroot
+
+# 3. 运行 ACME 演示客户端（注册账号 -> 新建申领 -> 写挑战应答 -> 验证 -> 签发 -> 下载）
+.venv/bin/python scripts/acme_demo.py --server http://127.0.0.1:8000 \
+  --domain api.lab.test --webroot ./webroot --out ./issued
+
+# 4. 验证证书链
+curl -s http://127.0.0.1:8000/ca/certificate -o ca_cert.pem
+openssl verify -CAfile ca_cert.pem ./issued/api.lab.test.pem
+```
+
+目录与 nonce 也可直接用 curl 查看：
+
+```sh
+curl -s http://127.0.0.1:8000/acme/directory
+curl -sI http://127.0.0.1:8000/acme/new-nonce | grep -i replay-nonce
+```
+
 ## 测试
 
 ```sh
@@ -108,4 +194,7 @@ openssl crl -in crl.pem -noout -CAfile ca_cert.pem -text
 ```
 
 测试覆盖：CSR/域名/密钥策略、证书扩展与链验证、幂等与并发去重、
-吊销原因冲突、CRL 编号并发一致、重启复用，以及 CA 缺失/不匹配拒绝启动。
+吊销原因冲突、CRL 编号并发一致、重启复用、CA 缺失/不匹配拒绝启动，
+以及 ACME 全流程（目录/nonce、账号注册与复用、JWS 签名/URL/nonce 校验、
+HTTP-01 成功与失败、finalize 与 SAN 校验、并发同 CSR 去重、账号隔离、
+过期拒绝、重启继续）。

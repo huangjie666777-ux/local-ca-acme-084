@@ -41,7 +41,8 @@ def validate_idempotency_key(key: object) -> str:
     return key
 
 
-def _normalize_dns_name(raw: str) -> str:
+def normalize_dns_name(raw: object) -> str:
+    """Validate and normalize one DNS name. Rejects wildcards and non-lab.test."""
     if not isinstance(raw, str) or not raw:
         raise PolicyError("SAN contains an empty DNS name")
     name = raw.strip().lower().rstrip(".")
@@ -57,6 +58,10 @@ def _normalize_dns_name(raw: str) -> str:
     ):
         raise PolicyError("only lab.test and its sub-domains are allowed")
     return name
+
+
+# Backwards-compatible alias.
+_normalize_dns_name = normalize_dns_name
 
 
 def validate_csr(csr: x509.CertificateSigningRequest) -> list[str]:

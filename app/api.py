@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
 from . import policy
+from .acme.api import PROBLEM_JSON, create_acme_router
+from .acme.errors import AcmeError
+from .acme.service import AcmeService
 from .service import CAService
 from .storage import (
     CertificateNotFound,
@@ -19,7 +22,8 @@ TEXT_PEM = "application/x-pem-file"
 
 class IssueRequest(BaseModel):
     csr: str = Field(description="PEM-encoded PKCS#10 certificate request")
-    days: int
+    # Strict mode: bool and string values are rejected, not coerced.
+    days: int = Field(strict=True)
     idempotency_key: str
 
 
@@ -27,8 +31,19 @@ class RevokeRequest(BaseModel):
     reason: str
 
 
-def create_app(service: CAService) -> FastAPI:
+def create_app(service: CAService, acme: AcmeService | None = None) -> FastAPI:
     app = FastAPI(title="Local Test CA")
+
+    @app.middleware("http")
+    async def acme_replay_nonce(request: Request, call_next):
+        response = await call_next(request)
+        if (
+            acme is not None
+            and request.url.path.startswith("/acme/")
+            and "replay-nonce" not in response.headers
+        ):
+            response.headers["Replay-Nonce"] = acme.new_nonce()
+        return response
 
     @app.exception_handler(policy.PolicyError)
     async def policy_error_handler(request: Request, exc: policy.PolicyError):
@@ -51,6 +66,24 @@ def create_app(service: CAService) -> FastAPI:
         request: Request, exc: RevocationReasonConflict
     ):
         return PlainTextResponse(str(exc), status_code=409)
+
+    @app.exception_handler(AcmeError)
+    async def acme_error_handler(request: Request, exc: AcmeError):
+        body = {
+            "type": f"urn:ietf:params:acme:error:{exc.acme_type}",
+            "status": exc.status,
+            "detail": exc.detail,
+        }
+        headers = {}
+        if acme is not None and exc.acme_type == "badNonce":
+            # A bad nonce consumes nothing; hand out a fresh one.
+            headers["Replay-Nonce"] = acme.new_nonce()
+        return JSONResponse(
+            content=body,
+            status_code=exc.status,
+            headers=headers,
+            media_type=PROBLEM_JSON,
+        )
 
     @app.get("/health")
     def health():
@@ -132,5 +165,8 @@ def create_app(service: CAService) -> FastAPI:
             media_type=TEXT_PEM,
             headers={"X-CRL-Number": str(number)},
         )
+
+    if acme is not None:
+        app.include_router(create_acme_router(acme))
 
     return app
